@@ -26,6 +26,18 @@ const args = process.argv.slice(2);
 const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
 const has = (name) => args.includes(name);
 
+// Reject unrecognized flags before doing anything (a typo like --dryrun must
+// not behave as a live run), and require values for value-taking flags.
+const KNOWN_FLAGS = new Set(["--agent", "--skill-only", "--no-skill", "--pin", "--strict", "--dry-run", "--help", "-h"]);
+const unknownFlags = args.filter((a) => a.startsWith("-") && !KNOWN_FLAGS.has(a));
+if (unknownFlags.length) die(`anyrea: unknown flag(s): ${unknownFlags.join(", ")}. See --help.`);
+for (const name of ["--agent", "--pin"]) {
+  if (args.includes(name)) {
+    const value = flag(name);
+    if (value === undefined || value.startsWith("-")) die(`anyrea: ${name} needs a value. See --help.`);
+  }
+}
+
 const ONLY_AGENT = flag("--agent");
 const PIN = flag("--pin");
 const SKILL_ONLY = has("--skill-only");
@@ -33,11 +45,13 @@ const NO_SKILL = has("--no-skill");
 const STRICT = has("--strict");
 const DRY = has("--dry-run");
 
-const p = (m) => process.stdout.write(m + "\n");
-const die = (m) => {
+function p(m) {
+  process.stdout.write(m + "\n");
+}
+function die(m) {
   process.stderr.write(m + "\n");
   process.exit(1);
-};
+}
 
 if (has("--help") || has("-h")) {
   p(`anyrea — connect REA (morluto/rea) to any agent.
@@ -56,7 +70,8 @@ Flags:
 
 Clients:
   claude, claude-desktop, codex, cursor, windsurf, gemini, opencode,
-  cline, zed, agents (shared ~/.agents/mcp.json — ZCode / FreeBuff),
+  cline, zed, zcode (registered via the shared ~/.agents/mcp.json fallback),
+  agents (shared ~/.agents/mcp.json — FreeBuff),
   generic (prints the JSON entry; you paste it anywhere).
 
 Examples:
@@ -111,6 +126,12 @@ function opencodeEntry() {
 
 // ---------------------------------------------------------------- targets
 
+// Zed: ~/.config/zed everywhere except Windows, which uses %APPDATA%\Zed
+// (per Zed's own crates/paths/src/paths.rs).
+const ZED_DIR = IS_WIN
+  ? join(process.env.APPDATA ?? join(HOME, "AppData", "Roaming"), "Zed")
+  : join(HOME, ".config", "zed");
+
 // kind: "mcpServers" (JSON with a mcpServers map), "opencode" (JSON with a mcp map),
 // "zed" (JSON context_servers), "toml" (codex), "print" (generic — no write).
 const TARGETS = [
@@ -138,8 +159,8 @@ const TARGETS = [
       : platform() === "darwin"
         ? join(HOME, "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json")
         : join(HOME, ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json") },
-  { id: "zed", label: "Zed", kind: "zed", home: () => join(HOME, ".config", "zed"),
-    config: () => join(HOME, ".config", "zed", "settings.json") },
+  { id: "zed", label: "Zed", kind: "zed", home: () => ZED_DIR,
+    config: () => join(ZED_DIR, "settings.json") },
   { id: "zcode", label: "ZCode", kind: "mcpServers", home: () => join(HOME, ".zcode", "cli"),
     config: () => join(HOME, ".agents", "mcp.json"), // REA's documented ZCode fallback registration path
     skills: () => [join(HOME, ".zcode", "skills"), join(HOME, ".agents", "skills")] },
@@ -229,7 +250,7 @@ function writeZed(t) {
 function writeCodexToml(t) {
   const file = t.config();
   const a = serverArgs();
-  const block = `[mcp_servers.rea]\ncommand = "npx"\nargs = [${a.map((s) => `"${s}"`).join(", ")}]\n`;
+  const block = `[mcp_servers.rea]\ncommand = "npx"\nargs = [${a.map((s) => `"${String(s).replace(/"/g, '\\"')}"`).join(", ")}]\n`;
   if (!existsSync(file)) {
     p(`  create: ${file}`);
     if (!DRY) { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, block); }
@@ -293,19 +314,30 @@ const summary = [];
 for (const t of plan) {
   p(`\n${t.label} (${t.id})`);
 
-  if (!SKILL_ONLY) {
-    if (existsSync(t.config()) || ONLY_AGENT) {
-      const writer = { mcpServers: writeMcpServers, opencode: writeOpencode, zed: writeZed, toml: writeCodexToml }[t.kind];
-      summary.push([t.label, writer(t)]);
-    } else {
-      p(`  skip:   config not found (agent not detected); use --agent ${t.id} to force`);
+  try {
+    if (!SKILL_ONLY) {
+      if (existsSync(t.config()) || ONLY_AGENT) {
+        const writer = { mcpServers: writeMcpServers, opencode: writeOpencode, zed: writeZed, toml: writeCodexToml }[t.kind];
+        summary.push([t.label, writer(t)]);
+      } else {
+        p(`  skip:   config not found (agent not detected); use --agent ${t.id} to force`);
+      }
     }
-  }
 
-  if (NO_SKILL) p("  skill:  skipped (--no-skill)");
-  else if (detected(t) && t.skills) installSkill(t.skills());
-  else if (detected(t)) p(`  skill:  no standard skills folder for this client — copy ${SKILL_SRC} manually`);
-  else p("  skill:  agent not detected — skipped");
+    if (NO_SKILL) p("  skill:  skipped (--no-skill)");
+    else if (detected(t) && t.skills) installSkill(t.skills());
+    else if (detected(t)) p(`  skill:  no standard skills folder for this client — copy ${SKILL_SRC} manually`);
+    else p("  skill:  agent not detected — skipped");
+  } catch (err) {
+    // One unreadable/unparsable config (comments in a JSONC file, a corrupt
+    // file, permissions) must not abort the remaining targets.
+    p(`  error:  ${err?.message ?? err}`);
+    if (err instanceof SyntaxError) {
+      p(`          ${t.config()} could not be parsed — it may contain comments or be corrupt.`);
+      p(`          Add the rea entry manually (see --agent generic) and keep this file as-is.`);
+    }
+    summary.push([t.label, "error (see above)"]);
+  }
 }
 
 p("\nSummary:");

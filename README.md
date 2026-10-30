@@ -64,7 +64,7 @@ and how to read the evidence — the server does the analysis.
 | Gemini CLI | `~/.gemini/settings.json` | `~/.agents/skills` |
 | opencode | `~/.config/opencode/opencode.json` | — |
 | Cline (VS Code) | `cline_mcp_settings.json` | — |
-| Zed | `~/.config/zed/settings.json` | — |
+| Zed | `settings.json` in `~/.config/zed` (`%APPDATA%\Zed` on Windows) | — |
 | FreeBuff | `~/.agents/mcp.json` | `~/.agents/skills` |
 | anything else | `--agent generic` prints the entry to paste | copy `skill/` manually |
 
